@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Near-Ultrasonic Message Test</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#17202a;background:#f4f7fb}
+body{max-width:760px;margin:0 auto;padding:18px}
+h1{font-size:1.55rem;margin-bottom:6px}
+p{line-height:1.45}
+.card{background:white;border-radius:16px;padding:18px;margin:14px 0;box-shadow:0 3px 14px #14213d12}
+label{display:block;font-weight:650;margin:12px 0 6px}
+input,textarea,select,button{font:inherit;width:100%;box-sizing:border-box;border-radius:10px;padding:11px;border:1px solid #cbd5e1}
+textarea{min-height:85px;resize:vertical}
+button{border:0;background:#175cd3;color:white;font-weight:700;margin-top:12px;cursor:pointer}
+button.secondary{background:#475467}
+button.stop{background:#b42318}
+.small{font-size:.9rem;color:#475467}
+.status{padding:10px;border-radius:9px;background:#eef4ff;margin-top:10px;overflow-wrap:anywhere}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:520px){.row{grid-template-columns:1fr}}
+code{overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<h1>Phone-to-phone audio message test</h1>
+<p>Use this page on both phones. On the sending phone, encode a short text message into two high-frequency tones. On the receiving phone, listen for those tones and decode the message.</p>
+<div class="card">
+<strong>Important limitations</strong>
+<ul>
+<li>This is an experiment, not secure or guaranteed inaudible messaging.</li>
+<li>High-frequency output and microphone sensitivity vary by phone. 17–18 kHz may fail, or may be audible to some people.</li>
+<li>Keep the phones close (about 10–30 cm) and test in a quiet room. Start with low volume.</li>
+<li>Microphone access requires permission and may require this page to be served over HTTPS.</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>1. Sender</h2>
+<label for="message">Message (short messages work best)</label>
+<textarea id="message" maxlength="80">MEET AT 8</textarea>
+<div class="row">
+<div><label for="f0">Tone for 0 (Hz)</label><input id="f0" type="number" min="15000" max="19500" step="100" value="17200"></div>
+<div><label for="f1">Tone for 1 (Hz)</label><input id="f1" type="number" min="15000" max="19500" step="100" value="18200"></div>
+</div>
+<label for="speed">Bit duration</label>
+<select id="speed"><option value="0.09">Fast (90 ms)</option><option value="0.15" selected>Medium (150 ms)</option><option value="0.22">Slow (220 ms, more robust)</option></select>
+<button id="send">Transmit message</button>
+<button id="stopSend" class="secondary">Stop tone</button>
+<div id="sendStatus" class="status">Ready to transmit.</div>
+</div>
+
+<div class="card">
+<h2>2. Receiver</h2>
+<p class="small">On the second phone, use the same tone frequencies and bit duration as the sender, then start listening before transmitting.</p>
+<button id="listen">Start listening</button>
+<button id="stopListen" class="stop">Stop listening</button>
+<div id="recvStatus" class="status">Microphone not active.</div>
+<label for="received">Decoded message</label>
+<textarea id="received" readonly placeholder="A decoded message will appear here."></textarea>
+</div>
+
+<div class="card">
+<h2>Tips if it doesn't work</h2>
+<ul>
+<li>Try 16,000 and 17,000 Hz if the phones cannot handle the higher frequencies. These may be audible.</li>
+<li>Try the slow bit duration and place the phones closer together.</li>
+<li>Turn off audio enhancements if your phone has them, and avoid playing other audio.</li>
+<li>Some devices or browsers filter out these frequencies, so failure doesn't necessarily mean the idea is impossible.</li>
+</ul>
+</div>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let audioCtx = null, osc = null, gain = null, micStream = null, analyser = null, raf = null;
+  let listening = false, decodedBits = "", lastBit = "", stableCount = 0, lastDetectedAt = 0;
+  let bitTimer = null;
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function getSettings(){
+    const f0 = Number($("f0").value), f1 = Number($("f1").value), bitMs = Number($("speed").value)*1000;
+    if(!Number.isFinite(f0)||!Number.isFinite(f1)||f0<15000||f1>19500||f1<=f0) throw new Error("Use two frequencies from 15,000–19,500 Hz, with tone 1 higher than tone 0.");
+    return {f0,f1,bitMs};
+  }
+  function bytesToBits(str){
+    const bytes = new TextEncoder().encode(str);
+    let bits = "";
+    // Preamble (alternating bits) plus start marker and 8-bit length.
+    for(let i=0;i<16;i++) bits += i%2 ? "0":"1";
+    bits += "11110000";
+    bits += bytes.length.toString(2).padStart(8,"0");
+    for(const b of bytes) bits += b.toString(2).padStart(8,"0");
+    bits += "00001111";
+    return bits;
+  }
+  function bitsToBytes(bits){
+    const marker = bits.indexOf("11110000");
+    if(marker < 0 || bits.length < marker+16) return null;
+    const len = parseInt(bits.slice(marker+8,marker+16),2);
+    if(!Number.isFinite(len) || len>80) return null;
+    const payload = bits.slice(marker+16,marker+16+len*8);
+    if(payload.length !== len*8) return null;
+    const bytes = [];
+    for(let i=0;i<payload.length;i+=8) bytes.push(parseInt(payload.slice(i,i+8),2));
+    try { return new TextDecoder().decode(new Uint8Array(bytes)); } catch(e){ return null; }
+  }
+  async function ensureAudio(){
+    if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if(audioCtx.state === "suspended") await audioCtx.resume();
+    return audioCtx;
+  }
+  async function transmit(){
+    try{
+      const {f0,f1,bitMs} = getSettings();
+      const msg = $("message").value;
+      if(!msg.trim()) throw new Error("Enter a message first.");
+      const ctx = await ensureAudio();
+      stopTransmit();
+      osc = ctx.createOscillator();
+      gain = ctx.createGain();
+      osc.type = "sine";
+      gain.gain.value = 0.0001;
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start();
+      const bits = bytesToBits(msg);
+      const now = ctx.currentTime;
+      const bitSec = bitMs/1000;
+      // Very low gain to begin with; phone media volume still controls output.
+      gain.gain.setValueAtTime(0.0001, now);
+      for(let i=0;i<bits.length;i++){
+        const t = now + i*bitSec;
+        osc.frequency.setValueAtTime(bits[i]==="1"?f1:f0,t);
+        gain.gain.setValueAtTime(0.025,t);
+        gain.gain.setValueAtTime(0.0001,t+bitSec*0.85);
+      }
+      $("sendStatus").textContent = `Transmitting ${msg.length} characters as ${bits.length} bits. Keep phones close.`;
+      bitTimer = setTimeout(() => {
+        stopTransmit();
+        $("sendStatus").textContent = "Transmission finished. Check the receiver.";
+      }, bits.length*bitMs+150);
+    }catch(e){$("sendStatus").textContent = e.message || String(e);}
+  }
+  function stopTransmit(){
+    if(bitTimer) clearTimeout(bitTimer); bitTimer=null;
+    if(osc){try{osc.stop();}catch(e){} try{osc.disconnect();}catch(e){} osc=null;}
+    if(gain){try{gain.disconnect();}catch(e){} gain=null;}
+  }
+  async function startListening(){
+    try{
+      const {f0,f1} = getSettings();
+      await ensureAudio();
+      if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This browser/context does not allow microphone access. Open the page over HTTPS in Chrome.");
+      stopListening();
+      micStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+      const source = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 16384;
+      analyser.smoothingTimeConstant = 0.05;
+      source.connect(analyser);
+      listening = true; decodedBits=""; lastBit=""; stableCount=0;
+      $("recvStatus").textContent = `Listening for ${f0} Hz and ${f1} Hz. Allow microphone access if prompted.`;
+      const data = new Float32Array(analyser.frequencyBinCount);
+      let lastSample = 0;
+      function loop(){
+        if(!listening) return;
+        analyser.getFloatFrequencyData(data);
+        const sr = audioCtx.sampleRate, binHz = sr/analyser.fftSize;
+        function energyNear(freq){
+          const center = Math.round(freq/binHz);
+          let max=-Infinity;
+          for(let k=Math.max(0,center-2);k<=Math.min(data.length-1,center+2);k++) max=Math.max(max,data[k]);
+          return max;
+        }
+        const e0=energyNear(f0), e1=energyNear(f1);
+        const now=performance.now();
+        // Sample the strongest tone periodically. Repeated samples help tolerate small timing jitter.
+        if(now-lastSample > 24){
+          lastSample=now;
+          const bit = (e1>e0 && e1>-95) ? "1" : (e0>e1 && e0>-95) ? "0" : "";
+          if(bit){
+            if(bit===lastBit) stableCount++; else {lastBit=bit;stableCount=1;}
+            // Avoid flooding the bit stream: accept a bit every ~bit duration, approximately.
+            const interval = Number($("speed").value)*1000;
+            if(stableCount>=2 && now-lastDetectedAt>interval*0.72){
+              decodedBits += bit; lastDetectedAt=now;
+              if(decodedBits.length>1800) decodedBits=decodedBits.slice(-1800);
+              const result=bitsToBytes(decodedBits);
+              if(result!==null){
+                $("received").value=result;
+                $("recvStatus").textContent="A message was decoded. You can keep listening for another message.";
+                // Keep trailing bits so a later frame can still be found.
+                decodedBits=decodedBits.slice(-32);
+              }
+            }
+          }
+        }
+        raf=requestAnimationFrame(loop);
+      }
+      loop();
+    }catch(e){stopListening();$("recvStatus").textContent=e.message || String(e);}
+  }
+  function stopListening(){
+    listening=false;
+    if(raf) cancelAnimationFrame(raf); raf=null;
+    if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
+    analyser=null;
+  }
+  $("send").addEventListener("click",transmit);
+  $("stopSend").addEventListener("click",()=>{stopTransmit();$("sendStatus").textContent="Transmission stopped.";});
+  $("listen").addEventListener("click",startListening);
+  $("stopListen").addEventListener("click",()=>{stopListening();$("recvStatus").textContent="Stopped listening.";});
+})();
+</script>
+</body>
+</html>
